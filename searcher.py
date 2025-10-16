@@ -1,74 +1,91 @@
-from typing import Dict, Tuple
-import apache_beam as beam
-from apache_beam.options.pipeline_options import PipelineOptions
+from __future__ import annotations
 
-from utils import (
-    load_index,
-    tokenize,
-    normalize_tokens,
-    tf_from_tokens,
-    tfidf_from_tf,
-    cosine_sparse,
-)
+import os
+import json
+import math
+import argparse
+from collections import Counter
+from typing import Dict, List, Tuple
 
-def build_query_vec(query: str, vocab_idf: Dict[str, float]) -> Dict[str, float]:
-    """Build an ENGLISH-ONLY TF-IDF vector for the query."""
-    tokens = normalize_tokens(tokenize(query), min_len=2, lemmatize=True)
-    tf = tf_from_tokens(tokens)
-    q_vec = tfidf_from_tf(tf, vocab_idf)
-    return q_vec
+from utils import lex, normalize_en
 
-class ComputeSimilarity(beam.DoFn):
-    """Compute cosine(query, doc_vector) -> (score, doc_id, path)."""
-    def __init__(self, query_vec: Dict[str, float]):
-        self.query_vec = query_vec
-    def process(self, doc_row: Tuple[str, str, Dict[str, float]]):
-        doc_id, path, vec = doc_row
-        score = cosine_sparse(self.query_vec, vec)
-        if score > 0.0:
-            yield (score, doc_id, path)
+
+def read_index(path: str) -> List[Dict]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Index not found: {path}")
+    data = json.load(open(path, "r", encoding="utf-8"))
+    # policz normę wektora, ale nic nie modyfikuj
+    for d in data:
+        d["_norm"] = math.sqrt(sum(v * v for v in d.get("tfidf", {}).values())) or 0.0
+    return data
+
+
+def vectorize_query(q: str, docs: List[Dict]) -> Tuple[Dict[str, float], float]:
+    """
+    TF-IDF zapytania liczone względem DF/N z indeksu (prosty IDF: log(1 + N/df)).
+    """
+    N = len(docs)
+    if N == 0:
+        return {}, 0.0
+
+    # DF odtworzone z indeksu (ile dokumentów ma dany token)
+    df: Dict[str, int] = {}
+    for d in docs:
+        for t in d["tfidf"].keys():
+            df[t] = df.get(t, 0) + 1
+
+    q_tokens = normalize_en(lex(q), lemmatize=True)
+    if not q_tokens:
+        return {}, 0.0
+
+    tf = Counter(q_tokens)  # surowe TF zapytania
+    idf = {t: math.log(1.0 + (N / float(df.get(t, 1)))) for t in df.keys()}
+
+    qvec = {t: tf[t] * idf.get(t, 0.0) for t in tf.keys() if t in idf and idf.get(t, 0.0) > 0.0}
+    qnorm = math.sqrt(sum(v * v for v in qvec.values())) or 0.0
+    return qvec, qnorm
+
+
+def cosine(qvec: Dict[str, float], qnorm: float, doc: Dict) -> float:
+    if qnorm <= 0.0 or doc.get("_norm", 0.0) <= 0.0:
+        return 0.0
+    # iloczyn tylko po wspólnych kluczach
+    dot = 0.0
+    dvec = doc.get("tfidf", {})
+    for t, w in qvec.items():
+        dv = dvec.get(t)
+        if dv:
+            dot += w * dv
+    return dot / (qnorm * doc["_norm"])
+
+
+def search(index_path: str, query: str, top_k: int = 10) -> List[Tuple[str, str, float]]:
+    docs = read_index(index_path)
+    qvec, qnorm = vectorize_query(query, docs)
+    if qnorm == 0.0:
+        return []
+
+    scored = [(d["id"], d["path"], cosine(qvec, qnorm, d)) for d in docs]
+    scored = [s for s in scored if s[2] > 0.0]
+    scored.sort(key=lambda x: (-x[2], x[1]))
+    return scored[:top_k]
+
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Searcher (cosine TF-IDF, ENGLISH ONLY)")
-    parser.add_argument("--db", required=True, help="Path to SQLite index")
-    parser.add_argument("--query", required=True, help="Search query (English)")
-    parser.add_argument("--top_k", type=int, default=10, help="Number of results to show")
-    args, beam_args = parser.parse_known_args()
+    ap = argparse.ArgumentParser(description="Search TF-IDF JSON index (EN-only).")
+    ap.add_argument("--index", default="tfidf_index.json", help="Path to JSON index file")
+    ap.add_argument("--q", required=True, help="Query string (English)")
+    ap.add_argument("--k", type=int, default=10, help="Top-K results")
+    args = ap.parse_args()
 
-    # 1) Load index
-    N, vocab_idf, documents = load_index(args.db)
-    if N == 0 or not documents:
-        print("Index empty. Run indexer first.")
+    hits = search(args.index, args.q, args.k)
+    if not hits:
+        print("No results.")
         return
+    print(f"Top {len(hits)} results:")
+    for i, (doc_id, path, score) in enumerate(hits, 1):
+        print(f"{i:2d}. {score:.6f}  {path}  [{doc_id}]")
 
-    # 2) Build query vector
-    q_vec = build_query_vec(args.query, vocab_idf)
-
-    # 3) Compute similarities with Beam and print Top-K
-    pipeline_options = PipelineOptions(beam_args or ["--runner=DirectRunner"])
-    with beam.Pipeline(options=pipeline_options) as p:
-        scores = (
-            p
-            | "CreateDocs" >> beam.Create(documents)
-            | "ComputeScores" >> beam.ParDo(ComputeSimilarity(q_vec))
-        )
-
-        top = scores | "TopK" >> beam.combiners.Top.Of(args.top_k, key=lambda t: t[0])
-
-        class PrintResults(beam.DoFn):
-            def process(self, _, top_list):
-                # Ensure descending order by score for display
-                top_sorted = sorted(top_list, key=lambda t: (-t[0], t[1]))
-                for rank, (score, doc_id, path) in enumerate(top_sorted, 1):
-                    print(f"{rank:2d}. score={score:.5f}  id={doc_id}  path={path}")
-                yield
-
-        _ = (
-            p
-            | "Dummy" >> beam.Create([None])
-            | "Print" >> beam.ParDo(PrintResults(), beam.pvalue.AsSingleton(top))
-        )
 
 if __name__ == "__main__":
     main()

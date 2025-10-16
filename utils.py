@@ -1,161 +1,111 @@
 from __future__ import annotations
 
-import apache_beam as beam
-
-import os
 import re
 import math
-import json
-import hashlib
-import sqlite3
-from typing import Dict, Iterable, List, Tuple
 from collections import Counter
+from typing import Dict, Iterable, List, Tuple
 
-# --- NLTK stopwords & lemmatizer (EN only) ---
+import apache_beam as beam
+from apache_beam import pvalue as beam_pvalue
+
 import nltk
-from nltk.corpus import stopwords
 from nltk.data import find as nltk_find
+from nltk.corpus import stopwords
 
-# Ensure required corpora are present (quietly)
 try:
-    nltk_find('corpora/stopwords')
+    STOP = set(stopwords.words("english"))
 except LookupError:
-    nltk.download('stopwords', quiet=True)
+    nltk.download("stopwords", quiet=True)
+    STOP = set(stopwords.words("english"))
 
 try:
-    nltk_find('corpora/wordnet')
+    nltk_find("corpora/wordnet")
     from nltk.stem import WordNetLemmatizer
     _HAS_WORDNET = True
 except LookupError:
-    nltk.download('wordnet', quiet=True)
+    nltk.download("wordnet", quiet=True)
+    nltk.download("omw-1.4", quiet=True)
     try:
-        nltk_find('corpora/wordnet')
+        nltk_find("corpora/wordnet")
         from nltk.stem import WordNetLemmatizer
         _HAS_WORDNET = True
     except LookupError:
         _HAS_WORDNET = False
 
-# --- Tokenization (EN-only alphanum) ---
-TOKEN_RE = re.compile(r"[A-Za-z0-9_]+", re.UNICODE)
+# Prostszy wzorzec: tylko litery eng, rozbijamy np. "can't" -> "can", "t"
+_TOK = re.compile(r"[A-Za-z]+")
 
-def tokenize(text: str) -> List[str]:
-    """Return lowercase alphanumeric tokens."""
-    if not text:
-        return []
-    return [t.lower() for t in TOKEN_RE.findall(text)]
 
-# English stopwords only
-_EN_STOPWORDS = set(stopwords.words('english'))
+def lex(text: str) -> List[str]:
+    """Ekstrakcja słów (lowercase, A-Z)."""
+    return _TOK.findall((text or "").lower())
 
-def normalize_tokens(tokens: Iterable[str],
-                     min_len: int = 2,
-                     lemmatize: bool = True) -> List[str]:
-    """
-    Filter by English stopwords & length; optional WordNet lemmatization.
-    """
-    toks = [t for t in tokens if len(t) >= min_len and t not in _EN_STOPWORDS]
+
+def normalize_en(tokens: Iterable[str], lemmatize: bool = True, min_len: int = 2) -> List[str]:
+    """Filtr EN: min długość, stopwords, opcjonalnie lematyzacja (WordNet)."""
+    toks = [t for t in tokens if len(t) >= min_len and t not in STOP]
     if lemmatize and _HAS_WORDNET:
-        lemm = WordNetLemmatizer()
-        toks = [lemm.lemmatize(t) for t in toks]
+        lem = WordNetLemmatizer()
+        toks = [lem.lemmatize(t) for t in toks]
     return toks
 
-# --- Vector math ---
-def tf_from_tokens(tokens: Iterable[str]) -> Dict[str, int]:
+
+def term_freq(tokens: Iterable[str]) -> Dict[str, int]:
     return dict(Counter(tokens))
 
-def idf_from_df(df: Dict[str, int], N: int) -> Dict[str, float]:
-    """Smoothed IDF: log((N+1)/(df+1)) + 1"""
-    return {term: math.log((N + 1) / (df_val + 1)) + 1.0 for term, df_val in df.items()}
 
-def tfidf_from_tf(tf: Dict[str, int], idf: Dict[str, float]) -> Dict[str, float]:
-    vec = {t: float(f) * idf.get(t, 0.0) for t, f in tf.items() if idf.get(t, 0.0) > 0.0}
-    norm = math.sqrt(sum(v*v for v in vec.values())) or 1.0
-    return {k: v / norm for k, v in vec.items()}
+# ---------- Beam DoFns ----------
 
-def cosine_sparse(a: Dict[str, float], b: Dict[str, float]) -> float:
-    if len(a) > len(b):
-        a, b = b, a
-    return sum(a.get(k, 0.0) * b.get(k, 0.0) for k in a.keys())
+class LoadText(beam.DoFn):
+    """Wejście: (doc_id, path) → wyjście: {id, path, text}."""
+    def process(self, pair: Tuple[str, str]):
+        doc_id, path = pair
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                txt = f.read()
+        except Exception:
+            txt = ""
+        yield {"id": doc_id, "path": path, "text": txt}
 
-# --- Stable document ID ---
-def stable_doc_id(path: str) -> str:
-    abspath = os.path.abspath(path)
-    return hashlib.sha1(abspath.encode('utf-8')).hexdigest()
 
-# --- Beam transforms ---
-class ReadFiles(beam.PTransform):
-    """Read files matching a glob; emit (path, text)."""
-    def __init__(self, file_glob: str):
-        super().__init__()
-        self.file_glob = file_glob
-    def expand(self, pcoll):
-        return (
-            pcoll
-            | "MatchFiles" >> beam.io.fileio.MatchFiles(self.file_glob)
-            | "ReadMatches" >> beam.io.fileio.ReadMatches()
-            | "ToPathText" >> beam.Map(lambda m: (m.metadata.path, m.read_utf8()))
-        )
+class TermStatsFn(beam.DoFn):
+    """
+    Z dokumentu robi:
+    - wyjście 'tf': (doc_id, path, {token:count}, total_count)
+    - wyjście 'df': (token, doc_id) do liczenia DF
+    """
+    def setup(self):
+        # Przyspieszenie: trzymamy lematyzer w workerze
+        self._lem = WordNetLemmatizer() if _HAS_WORDNET else None
 
-class ToDocTF(beam.DoFn):
-    """(path,text) -> (doc_id, {'path','tf','unique_terms'}) in ENGLISH ONLY."""
-    def __init__(self, min_len: int = 2, lemmatize: bool = True):
-        self.min_len = min_len
-        self.lemmatize = lemmatize
-    def process(self, path_text: Tuple[str, str]):
-        path, text = path_text
-        doc_id = stable_doc_id(path)
-        tokens = normalize_tokens(tokenize(text), min_len=self.min_len, lemmatize=self.lemmatize)
-        tf = tf_from_tokens(tokens)
-        yield (doc_id, {"path": path, "tf": tf, "unique_terms": list(tf.keys())})
+    def process(self, doc: Dict):
+        tokens = normalize_en(lex(doc["text"]), lemmatize=bool(self._lem))
+        counts = Counter(tokens)
+        total = sum(counts.values())
 
-# --- SQLite helpers ---
-def write_sqlite_rows(db_path: str, rows):
-    """Write ('doc'|'vocab'|'meta', payload) rows to SQLite."""
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS documents (
-        doc_id TEXT PRIMARY KEY,
-        path   TEXT NOT NULL,
-        vector_json TEXT NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS vocab (
-        term TEXT PRIMARY KEY,
-        df   INTEGER NOT NULL,
-        idf  REAL NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    )""")
-    conn.commit()
-    for kind, payload in rows:
-        if kind == 'doc':
-            doc_id, path, vec = payload
-            cur.execute("INSERT OR REPLACE INTO documents(doc_id, path, vector_json) VALUES(?,?,?)",
-                        (doc_id, path, json.dumps(vec, ensure_ascii=False)))
-        elif kind == 'vocab':
-            term, df_val, idf_val = payload
-            cur.execute("INSERT OR REPLACE INTO vocab(term, df, idf) VALUES(?,?,?)",
-                        (term, int(df_val), float(idf_val)))
-        elif kind == 'meta':
-            key, value = payload
-            cur.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)",
-                        (key, str(value)))
-    conn.commit()
-    conn.close()
+        # TF do dalszych obliczeń
+        yield beam.pvalue.TaggedOutput("tf", (doc["id"], doc["path"], dict(counts), total))
+        # (token, doc_id) do DF (później Distinct → Count)
+        for tok in counts.keys():
+            yield beam.pvalue.TaggedOutput("df", (tok, doc["id"]))
 
-def load_index(db_path: str):
-    """Load N, vocab idf dict, and document vectors from SQLite."""
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM meta WHERE key='N'")
-    row = cur.fetchone()
-    N = int(row[0]) if row else 0
-    vocab_idf: Dict[str, float] = {}
-    for term, idf_val in cur.execute("SELECT term, idf FROM vocab"):
-        vocab_idf[term] = float(idf_val)
-    documents = []
-    for doc_id, path, vector_json in cur.execute("SELECT doc_id, path, vector_json FROM documents"):
-        documents.append((doc_id, path, json.loads(vector_json)))
-    conn.close()
-    return N, vocab_idf, documents
+
+class MakeTfIdfFn(beam.DoFn):
+    """Z TF + (DF, N) robi słownik TF-IDF (bez normalizacji do 1 — to po stronie searchera)."""
+    def process(self, tf_row, df_map: Dict[str, int], N: int):
+        doc_id, path, counts, total = tf_row
+        if total <= 0:
+            yield {"id": doc_id, "path": path, "tfidf": {}}
+            return
+
+        # TF (częstość względna)
+        tf_rel = {t: c / float(total) for t, c in counts.items()}
+
+        # Smoothed IDF: log(1 + N/df)
+        tfidf = {}
+        for t in counts.keys():
+            df = df_map.get(t, 0) or 1
+            idf = math.log(1.0 + (N / float(df)))
+            tfidf[t] = tf_rel[t] * idf
+
+        yield {"id": doc_id, "path": path, "tfidf": tfidf}
